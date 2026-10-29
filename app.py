@@ -2,10 +2,10 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 
-import feedparser
+
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+
 import requests
 import streamlit as st
 
