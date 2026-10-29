@@ -1,49 +1,45 @@
 import os
-import re
 import sqlite3
 from datetime import datetime, timezone
 
-
+import feedparser
 import numpy as np
 import pandas as pd
-
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
 
-# ============================================================
-# APPLICATION SETTINGS
-# ============================================================
-
 st.set_page_config(
-    page_title="EUR/USD Research Engine",
+    page_title="EUR/USD Research Dashboard",
     page_icon="💶",
     layout="wide",
 )
 
-APP_NAME = "EUR/USD Research Engine"
-DATABASE = "eurusd_research.db"
+st.title("EUR/USD Research Dashboard")
+st.caption(
+    "Information only — no automatic trading and no broker connection."
+)
+
 
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
+DATABASE = "eurusd_history.db"
 
-FRED_SERIES = {
+SERIES = {
     "EUR/USD": "DEXUSEU",
-    "US 10Y Yield": "DGS10",
-    "US 2Y Yield": "DGS2",
+    "US 10Y": "DGS10",
+    "US 2Y": "DGS2",
     "US CPI": "CPIAUCSL",
-    "US Unemployment": "UNRATE",
-    "Euro Area CPI": "CP0000EZ19M086NEST",
-    "WTI Oil": "DCOILWTICO",
+    "Euro CPI": "CP0000EZ19M086NEST",
+    "Oil": "DCOILWTICO",
     "Gold": "GOLDAMGBD228NLBM",
 }
 
-NEWS_FEEDS = {
+FEEDS = {
     "Federal Reserve": (
         "https://www.federalreserve.gov/feeds/press_all.xml"
     ),
-    "ECB": (
-        "https://www.ecb.europa.eu/rss/press.html"
-    ),
+    "ECB": "https://www.ecb.europa.eu/rss/press.html",
     "Market News": (
         "https://feeds.finance.yahoo.com/rss/2.0/"
         "headline?s=EURUSD=X&region=US&lang=en-US"
@@ -51,50 +47,31 @@ NEWS_FEEDS = {
 }
 
 
-# ============================================================
-# SECRETS AND DATABASE
-# ============================================================
-
-def get_secret(name, default=""):
+def secret(name, default=""):
     try:
         return st.secrets.get(name, os.getenv(name, default))
     except Exception:
         return os.getenv(name, default)
 
 
-def database_connection():
-    connection = sqlite3.connect(DATABASE)
-    connection.row_factory = sqlite3.Row
-    return connection
+def database():
+    return sqlite3.connect(DATABASE)
 
 
-def initialize_database():
-    connection = database_connection()
+def setup_database():
+    connection = database()
 
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            decision TEXT NOT NULL,
-            score REAL NOT NULL,
-            confidence REAL NOT NULL,
-            data_quality REAL NOT NULL,
-            eurusd REAL,
-            reasons TEXT NOT NULL
-        )
-        """
-    )
-
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS news (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            source TEXT NOT NULL,
-            title TEXT NOT NULL,
-            link TEXT,
-            published TEXT
+            created_at TEXT,
+            decision TEXT,
+            score REAL,
+            confidence REAL,
+            quality REAL,
+            price REAL,
+            reasons TEXT
         )
         """
     )
@@ -103,21 +80,13 @@ def initialize_database():
     connection.close()
 
 
-def save_decision(result, eurusd):
-    connection = database_connection()
+def save_result(result, price):
+    connection = database()
 
     connection.execute(
         """
         INSERT INTO decisions
-        (
-            created_at,
-            decision,
-            score,
-            confidence,
-            data_quality,
-            eurusd,
-            reasons
-        )
+        (created_at, decision, score, confidence, quality, price, reasons)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
@@ -125,8 +94,8 @@ def save_decision(result, eurusd):
             result["decision"],
             result["score"],
             result["confidence"],
-            result["data_quality"],
-            eurusd,
+            result["quality"],
+            price,
             " | ".join(result["reasons"]),
         ),
     )
@@ -135,72 +104,59 @@ def save_decision(result, eurusd):
     connection.close()
 
 
-def get_decision_history(limit=100):
-    connection = database_connection()
+def history():
+    connection = database()
 
-    rows = connection.execute(
+    frame = pd.read_sql_query(
         """
         SELECT *
         FROM decisions
         ORDER BY id DESC
-        LIMIT ?
+        LIMIT 50
         """,
-        (limit,),
-    ).fetchall()
+        connection,
+    )
 
     connection.close()
-
-    if not rows:
-        return pd.DataFrame()
-
-    return pd.DataFrame([dict(row) for row in rows])
+    return frame
 
 
-# ============================================================
-# DATA RETRIEVAL
-# ============================================================
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_fred_series(series_id, limit=500):
-    api_key = get_secret("FRED_API_KEY")
+def get_fred(series_id, limit=400):
+    api_key = secret("FRED_API_KEY")
 
     if not api_key:
-        return pd.DataFrame(), "FRED_API_KEY is missing"
-
-    parameters = {
-        "series_id": series_id,
-        "api_key": api_key,
-        "file_type": "json",
-        "sort_order": "asc",
-        "limit": limit,
-    }
+        return pd.DataFrame(), "Missing FRED_API_KEY"
 
     try:
         response = requests.get(
             FRED_URL,
-            params=parameters,
+            params={
+                "series_id": series_id,
+                "api_key": api_key,
+                "file_type": "json",
+                "sort_order": "asc",
+                "limit": limit,
+            },
             timeout=20,
         )
+
         response.raise_for_status()
 
-        observations = response.json().get("observations", [])
         rows = []
 
-        for observation in observations:
+        for item in response.json().get("observations", []):
             try:
                 rows.append(
                     {
-                        "date": pd.to_datetime(
-                            observation["date"]
-                        ),
-                        "value": float(observation["value"]),
+                        "date": pd.to_datetime(item["date"]),
+                        "value": float(item["value"]),
                     }
                 )
             except (ValueError, TypeError):
-                continue
+                pass
 
         if not rows:
-            return pd.DataFrame(), "No valid data returned"
+            return pd.DataFrame(), "No usable observations"
 
         return pd.DataFrame(rows).set_index("date"), None
 
@@ -208,12 +164,11 @@ def get_fred_series(series_id, limit=500):
         return pd.DataFrame(), str(error)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def get_ecb_eurusd(limit=500):
+def get_ecb():
     url = (
         "https://data-api.ecb.europa.eu/service/data/"
         "EXR/D.USD.EUR.SP00.A"
-        f"?format=jsondata&lastNObservations={limit}"
+        "?format=jsondata&lastNObservations=400"
     )
 
     try:
@@ -221,11 +176,14 @@ def get_ecb_eurusd(limit=500):
         response.raise_for_status()
 
         payload = response.json()
-        dataset = payload["dataSets"][0]
-        series = next(iter(dataset["series"].values()))
+        series = next(
+            iter(payload["dataSets"][0]["series"].values())
+        )
 
-        observations = series["observations"]
-        values = [float(item[0]) for item in observations.values()]
+        values = [
+            float(item[0])
+            for item in series["observations"].values()
+        ]
 
         dates = payload["structure"]["dimensions"]["observation"][0][
             "values"
@@ -236,48 +194,35 @@ def get_ecb_eurusd(limit=500):
             for item in dates[-len(values):]
         ]
 
-        frame = pd.DataFrame(
-            {
-                "date": dates,
-                "value": values,
-            }
-        ).set_index("date")
-
-        return frame, None
+        return pd.DataFrame(
+            {"value": values},
+            index=dates,
+        ), None
 
     except Exception as error:
         return pd.DataFrame(), str(error)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
 def get_news():
     rows = []
 
-    for source, url in NEWS_FEEDS.items():
+    for source, url in FEEDS.items():
         try:
             feed = feedparser.parse(url)
 
-            for entry in feed.entries[:10]:
+            for item in feed.entries[:10]:
                 rows.append(
                     {
                         "source": source,
-                        "title": entry.get("title", ""),
-                        "link": entry.get("link", ""),
-                        "published": entry.get(
-                            "published",
-                            entry.get("updated", ""),
-                        ),
+                        "title": item.get("title", ""),
+                        "link": item.get("link", ""),
                     }
                 )
         except Exception:
-            continue
+            pass
 
     return pd.DataFrame(rows)
 
-
-# ============================================================
-# FEATURE ENGINEERING
-# ============================================================
 
 def add_features(frame, name):
     if frame.empty:
@@ -286,25 +231,14 @@ def add_features(frame, name):
     data = frame.copy()
     data.columns = [name]
 
-    data[f"{name}_return_1"] = data[name].pct_change(1)
-    data[f"{name}_return_5"] = data[name].pct_change(5)
-    data[f"{name}_return_20"] = data[name].pct_change(20)
-
-    data[f"{name}_ma_20"] = (
-        data[name].rolling(20, min_periods=5).mean()
-    )
-
-    data[f"{name}_volatility"] = (
-        data[f"{name}_return_1"]
-        .rolling(20, min_periods=5)
-        .std()
-        * np.sqrt(252)
-    )
+    data["return_5"] = data[name].pct_change(5)
+    data["average_20"] = data[name].rolling(20).mean()
+    data["volatility"] = data[name].pct_change().rolling(20).std()
 
     return data
 
 
-def latest_return(frame, column, periods=5):
+def recent_return(frame, column, periods=5):
     if frame.empty or column not in frame:
         return np.nan
 
@@ -316,62 +250,14 @@ def latest_return(frame, column, periods=5):
     return values.pct_change(periods).iloc[-1]
 
 
-def latest_value(frame, column):
-    if frame.empty or column not in frame:
-        return np.nan
-
-    values = frame[column].dropna()
-
-    if values.empty:
-        return np.nan
-
-    return values.iloc[-1]
-
-
-def bounded_signal(value, multiplier=100, maximum=3):
+def signal(value, multiplier=100, maximum=3):
     if pd.isna(value):
         return np.nan
 
     return float(np.tanh(value * multiplier) * maximum)
 
 
-# ============================================================
-# NEWS AND EVENT RISK
-# ============================================================
-
-def detect_event_risk(news):
-    if news.empty:
-        return 0, "No news feed data available"
-
-    keywords = [
-        "interest rate",
-        "federal reserve",
-        "fed",
-        "ecb",
-        "inflation",
-        "cpi",
-        "employment",
-        "jobs",
-        "nonfarm",
-        "unemployment",
-        "central bank",
-        "monetary policy",
-        "rate decision",
-    ]
-
-    text = " ".join(news["title"].astype(str)).lower()
-    matches = sum(text.count(keyword) for keyword in keywords)
-
-    if matches >= 5:
-        return 80, "High-impact monetary or economic headlines detected"
-
-    if matches >= 2:
-        return 50, "Relevant economic headlines detected"
-
-    return 20, "No major event concentration detected"
-
-
-def headline_sentiment(news):
+def headline_score(news):
     if news.empty:
         return 0
 
@@ -380,140 +266,115 @@ def headline_sentiment(news):
         "strong",
         "improves",
         "recovery",
-        "higher",
-        "optimism",
         "support",
     ]
 
     negative = [
-        "fall",
         "weak",
+        "fall",
         "recession",
         "crisis",
-        "lower",
         "risk",
         "uncertainty",
     ]
 
-    score = 0
+    total = 0
 
     for title in news["title"].astype(str).str.lower():
-        score += sum(word in title for word in positive)
-        score -= sum(word in title for word in negative)
+        total += sum(word in title for word in positive)
+        total -= sum(word in title for word in negative)
 
-    return max(-3, min(3, score / 3))
+    return max(-3, min(3, total / 3))
 
 
-# ============================================================
-# RESEARCH ENGINE
-# ============================================================
-
-def calculate_research(data, news):
+def research(data, news):
     factors = []
     reasons = []
 
-    def add_factor(name, signal, weight, explanation):
-        if not pd.isna(signal):
+    def add(name, value, weight, explanation):
+        if not pd.isna(value):
             factors.append(
                 {
                     "Factor": name,
-                    "Signal": signal,
+                    "Signal": value,
                     "Weight": weight,
-                    "Contribution": signal * weight,
+                    "Contribution": value * weight,
                 }
             )
             reasons.append(explanation)
 
     eurusd = data.get("EUR/USD", pd.DataFrame())
-    us10 = data.get("US 10Y Yield", pd.DataFrame())
-    us2 = data.get("US 2Y Yield", pd.DataFrame())
+    us10 = data.get("US 10Y", pd.DataFrame())
+    us2 = data.get("US 2Y", pd.DataFrame())
     us_cpi = data.get("US CPI", pd.DataFrame())
-    eu_cpi = data.get("Euro Area CPI", pd.DataFrame())
-    oil = data.get("WTI Oil", pd.DataFrame())
+    euro_cpi = data.get("Euro CPI", pd.DataFrame())
+    oil = data.get("Oil", pd.DataFrame())
     gold = data.get("Gold", pd.DataFrame())
 
-    eurusd_change = latest_return(eurusd, "EUR/USD", 5)
-
-    add_factor(
-        "EUR/USD momentum",
-        bounded_signal(eurusd_change, 100, 3),
+    add(
+        "EUR/USD movement",
+        signal(recent_return(eurusd, "EUR/USD")),
         25,
-        "Five-period EUR/USD movement was analyzed.",
+        "Recent EUR/USD movement was analyzed.",
     )
 
-    us10_change = latest_return(us10, "US 10Y Yield", 5)
-
-    add_factor(
-        "U.S. 10Y yield",
-        -bounded_signal(us10_change, 100, 3),
+    add(
+        "U.S. 10-year yield",
+        -signal(recent_return(us10, "US 10Y")),
         15,
         "U.S. 10-year yield movement was analyzed.",
     )
 
-    us2_change = latest_return(us2, "US 2Y Yield", 5)
-
-    add_factor(
-        "U.S. 2Y yield",
-        -bounded_signal(us2_change, 100, 3),
+    add(
+        "U.S. 2-year yield",
+        -signal(recent_return(us2, "US 2Y")),
         15,
         "U.S. 2-year yield movement was analyzed.",
     )
 
-    us_inflation = latest_return(us_cpi, "US CPI", 3)
-    eu_inflation = latest_return(eu_cpi, "Euro Area CPI", 3)
+    us_inflation = recent_return(us_cpi, "US CPI", 3)
+    euro_inflation = recent_return(euro_cpi, "Euro CPI", 3)
 
-    if not pd.isna(us_inflation) and not pd.isna(eu_inflation):
-        inflation_difference = eu_inflation - us_inflation
-
-        add_factor(
-            "Inflation differential",
-            bounded_signal(inflation_difference, 100, 2),
+    if not pd.isna(us_inflation) and not pd.isna(euro_inflation):
+        add(
+            "Inflation difference",
+            signal(euro_inflation - us_inflation, maximum=2),
             15,
-            "Relative U.S. and euro-area inflation was analyzed.",
+            "U.S. and euro-area inflation were compared.",
         )
 
-    oil_change = latest_return(oil, "WTI Oil", 5)
-
-    add_factor(
+    add(
         "Oil pressure",
-        -bounded_signal(oil_change, 100, 1),
+        -signal(recent_return(oil, "Oil"), maximum=1),
         5,
         "Oil-price movement was analyzed.",
     )
 
-    gold_change = latest_return(gold, "Gold", 5)
-
-    add_factor(
-        "Risk sentiment",
-        -bounded_signal(gold_change, 100, 1),
+    add(
+        "Gold risk signal",
+        -signal(recent_return(gold, "Gold"), maximum=1),
         5,
-        "Gold movement was analyzed as a risk indicator.",
+        "Gold movement was analyzed as a risk signal.",
     )
 
-    news_score = headline_sentiment(news)
-
-    add_factor(
+    add(
         "News sentiment",
-        news_score,
+        headline_score(news),
         5,
-        "Recent headlines were analyzed for broad sentiment.",
+        "Recent headlines were analyzed.",
     )
 
-    event_risk, event_message = detect_event_risk(news)
+    factor_frame = pd.DataFrame(factors)
 
-    if not factors:
+    if factor_frame.empty:
         return {
             "decision": "WAIT",
             "score": 0,
             "confidence": 0,
-            "data_quality": 0,
-            "event_risk": event_risk,
-            "event_message": event_message,
-            "reasons": ["No usable data was available."],
-            "factors": pd.DataFrame(),
+            "quality": 0,
+            "reasons": ["No usable research data was found."],
+            "factors": factor_frame,
         }
-
-    factor_frame = pd.DataFrame(factors)
 
     score = (
         factor_frame["Contribution"].sum()
@@ -521,189 +382,131 @@ def calculate_research(data, news):
         * 100
     )
 
-    data_quality = (
-        factor_frame["Weight"].sum()
-        / 90
-        * 100
-    )
-
-    agreement = (
-        abs(factor_frame["Signal"].mean())
-        / 3
-        * 100
-    )
+    quality = factor_frame["Weight"].sum() / 90 * 100
+    agreement = abs(factor_frame["Signal"].mean()) / 3 * 100
 
     confidence = (
         abs(score) * 0.55
-        + data_quality * 0.25
+        + quality * 0.25
         + agreement * 0.20
     )
 
-    if event_risk >= 75:
-        confidence *= 0.75
-        reasons.append("High event risk reduced confidence.")
-
     confidence = max(0, min(95, confidence))
 
-    if data_quality < 50 or confidence < 55:
+    if quality < 50 or confidence < 55:
         decision = "WAIT"
-        reasons.append("Data coverage or confidence is too low.")
+        reasons.append("Data quality or confidence is too low.")
     elif score >= 60:
         decision = "BUY EUR/USD"
     elif score <= -60:
         decision = "SELL EUR/USD"
     else:
         decision = "WAIT"
-        reasons.append("Signals are mixed.")
+        reasons.append("The signals are mixed.")
 
     return {
         "decision": decision,
         "score": score,
         "confidence": confidence,
-        "data_quality": data_quality,
-        "event_risk": event_risk,
-        "event_message": event_message,
+        "quality": quality,
         "reasons": reasons,
         "factors": factor_frame,
     }
 
 
 # ============================================================
-# INITIALIZATION AND REFRESH
+# RUN RESEARCH EVERY TIME THE APP RUNS
 # ============================================================
 
-initialize_database()
+setup_database()
 
-st.sidebar.header("Research controls")
-
-if st.sidebar.button("🔄 Refresh research now"):
+if st.button("🔄 Research again now"):
     st.cache_data.clear()
     st.rerun()
-
-period = st.sidebar.selectbox(
-    "Chart period",
-    ["3 months", "6 months", "1 year"],
-    index=1,
-)
-
-limits = {
-    "3 months": 100,
-    "6 months": 200,
-    "1 year": 500,
-}
-
-limit = limits[period]
 
 data = {}
 errors = {}
 
-for label, series_id in FRED_SERIES.items():
-    frame, error = get_fred_series(series_id, limit)
+for name, series_id in SERIES.items():
+    frame, error = get_fred(series_id)
 
     if error:
-        data[label] = pd.DataFrame()
-        errors[label] = error
+        data[name] = pd.DataFrame()
+        errors[name] = error
     else:
-        data[label] = add_features(frame, label)
+        data[name] = add_features(frame, name)
 
 if data["EUR/USD"].empty:
-    ecb_frame, ecb_error = get_ecb_eurusd(limit)
+    ecb_frame, ecb_error = get_ecb()
 
     if not ecb_frame.empty:
-        data["EUR/USD"] = add_features(
-            ecb_frame,
-            "EUR/USD",
-        )
+        data["EUR/USD"] = add_features(ecb_frame, "EUR/USD")
     else:
         errors["ECB EUR/USD"] = ecb_error
 
 news = get_news()
-research = calculate_research(data, news)
+result = research(data, news)
 
-eurusd_price = latest_value(
-    data.get("EUR/USD", pd.DataFrame()),
-    "EUR/USD",
-)
+eurusd = data["EUR/USD"]
 
-save_decision(research, eurusd_price)
+if eurusd.empty:
+    current_price = np.nan
+else:
+    current_price = eurusd["EUR/USD"].dropna().iloc[-1]
+
+save_result(result, current_price)
 
 
 # ============================================================
-# DASHBOARD
+# DISPLAY RESULT
 # ============================================================
-
-st.title(APP_NAME)
-st.caption(
-    "Automatic research dashboard — information only, "
-    "no broker connection and no trade execution."
-)
-
-st.subheader("Final decision")
 
 first, second, third, fourth = st.columns(4)
 
 with first:
-    st.metric("Decision", research["decision"])
+    st.metric("Decision", result["decision"])
 
 with second:
-    st.metric("Confidence", f"{research['confidence']:.0f}%")
+    st.metric("Confidence", f"{result['confidence']:.0f}%")
 
 with third:
-    st.metric("Score", f"{research['score']:.1f}")
+    st.metric("Score", f"{result['score']:.1f}")
 
 with fourth:
-    if pd.isna(eurusd_price):
+    if pd.isna(current_price):
         st.metric("EUR/USD", "Unavailable")
     else:
-        st.metric("EUR/USD", f"{eurusd_price:.5f}")
+        st.metric("EUR/USD", f"{current_price:.5f}")
 
-if research["decision"] == "BUY EUR/USD":
-    st.success("Research currently favors euro strength.")
-
-elif research["decision"] == "SELL EUR/USD":
-    st.error("Research currently favors dollar strength.")
-
-else:
-    st.warning("Research is mixed or incomplete. No directional decision.")
-
-st.subheader("Why this decision was produced")
-
-for reason in research["reasons"]:
+for reason in result["reasons"]:
     st.write(f"- {reason}")
 
-st.write(
-    f"**Event risk:** {research['event_risk']}/100 — "
-    f"{research['event_message']}"
-)
-
 
 # ============================================================
-# EUR/USD GRAPH
+# GRAPH
 # ============================================================
 
-st.subheader("EUR/USD price graph")
-
-eurusd = data.get("EUR/USD", pd.DataFrame())
+st.subheader("EUR/USD graph")
 
 if not eurusd.empty:
-    chart = eurusd.reset_index()
+    chart_data = eurusd.reset_index()
 
     figure = go.Figure()
 
     figure.add_trace(
         go.Scatter(
-            x=chart["date"],
-            y=chart["EUR/USD"],
+            x=chart_data["date"],
+            y=chart_data["EUR/USD"],
             mode="lines",
             name="EUR/USD",
         )
     )
 
-    if "EUR/USD_ma_20" in chart:
+    if "average_20" in chart_data:
         figure.add_trace(
             go.Scatter(
-                x=chart["date"],
-                y=chart["EUR/USD_ma_20"],
+                x=chart_data["date"],
+                y=chart_data["average_20"],
                 mode="lines",
                 name="20-period average",
             )
@@ -718,76 +521,40 @@ if not eurusd.empty:
 
     st.plotly_chart(figure, use_container_width=True)
 
-else:
-    st.warning("EUR/USD graph data is unavailable.")
 
+st.subheader("Factor contributions")
 
-# ============================================================
-# FACTOR GRAPH
-# ============================================================
+if not result["factors"].empty:
+    factors = result["factors"]
 
-st.subheader("Research factor contributions")
-
-factors = research["factors"]
-
-if not factors.empty:
     figure = go.Figure(
         go.Bar(
             x=factors["Contribution"],
             y=factors["Factor"],
             orientation="h",
             marker_color=[
-                "#16a34a" if value > 0 else "#dc2626"
+                "green" if value > 0 else "red"
                 for value in factors["Contribution"]
             ],
         )
     )
 
-    figure.update_layout(
-        height=450,
-        xaxis_title="Contribution toward EUR/USD",
-        yaxis_title="Factor",
-    )
+    figure.update_layout(height=450)
 
     st.plotly_chart(figure, use_container_width=True)
 
-    st.dataframe(
-        factors.style.format(
-            {
-                "Signal": "{:.2f}",
-                "Weight": "{:.1f}",
-                "Contribution": "{:.2f}",
-            }
-        ),
-        use_container_width=True,
-    )
 
-
-# ============================================================
-# NEWS
-# ============================================================
-
-st.subheader("Recent research headlines")
+st.subheader("Recent headlines")
 
 if news.empty:
-    st.info("No news feed data was available.")
+    st.info("No headlines were found.")
 else:
     for _, item in news.head(15).iterrows():
-        title = str(item["title"])
-        source = str(item["source"])
-        link = str(item["link"])
+        st.markdown(
+            f"- **{item['source']}:** "
+            f"[{item['title']}]({item['link']})"
+        )
 
-        if link:
-            st.markdown(
-                f"- **{source}:** [{title}]({link})"
-            )
-        else:
-            st.write(f"- **{source}:** {title}")
-
-
-# ============================================================
-# DATA QUALITY AND HISTORY
-# ============================================================
 
 st.subheader("Data quality")
 
@@ -800,41 +567,34 @@ st.write(f"Available datasets: {available}/{total}")
 st.write(f"Data coverage: {quality:.0f}%")
 
 if errors:
-    with st.expander("Unavailable datasets"):
+    with st.expander("Unavailable data"):
         for name, error in errors.items():
             st.write(f"**{name}:** {error}")
 
+
 st.subheader("Decision history")
 
-history = get_decision_history(50)
+history_data = history()
 
-if history.empty:
-    st.info("No decision history available yet.")
+if history_data.empty:
+    st.info("No stored decisions yet.")
 else:
-    history["created_at"] = pd.to_datetime(
-        history["created_at"]
-    )
-
     st.dataframe(
-        history[
+        history_data[
             [
                 "created_at",
                 "decision",
                 "score",
                 "confidence",
-                "data_quality",
-                "eurusd",
+                "quality",
+                "price",
             ]
         ],
         use_container_width=True,
     )
 
-st.caption(
-    "Last checked: "
-    + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-)
 
 st.caption(
-    "This system is experimental. It does not guarantee direction "
-    "and does not place trades."
+    "Last research run: "
+    + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 )
